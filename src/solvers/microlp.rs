@@ -2,10 +2,11 @@
 
 use std::time::Duration;
 
-use microlp::{Error, StopReason};
+use microlp::{Error, SolveOptions, Status};
 
+use crate::solvers::MipGapError;
 use crate::variable::{UnsolvedProblem, VariableDefinition};
-use crate::{Constraint, Variable};
+use crate::{Constraint, Variable, WithInitialSolution, WithMipGap};
 use crate::{
     constraint::ConstraintReference,
     solvers::{
@@ -25,6 +26,8 @@ pub fn microlp(to_solve: UnsolvedProblem) -> MicroLpProblem {
         ObjectiveDirection::Maximisation => microlp::OptimizationDirection::Maximize,
         ObjectiveDirection::Minimisation => microlp::OptimizationDirection::Minimize,
     });
+    let mut initial_solution = Vec::with_capacity(variables.initial_solution_len());
+    let mut construction_error = None;
     let variables: Vec<microlp::Variable> = variables
         .iter_variables_with_def()
         .map(
@@ -33,16 +36,55 @@ pub fn microlp(to_solve: UnsolvedProblem) -> MicroLpProblem {
                 &VariableDefinition {
                     min,
                     max,
+                    initial,
                     is_integer,
                     ..
                 },
             )| {
                 let coeff = *objective.linear.coefficients.get(&var).unwrap_or(&0.);
-                if is_integer {
-                    problem.add_integer_var(coeff, (min as i32, max as i32))
+                let microlp_var = if is_integer {
+                    let min = if min == f64::NEG_INFINITY {
+                        Some(i32::MIN)
+                    } else {
+                        let min = min.ceil();
+                        (i32::MIN as f64..=i32::MAX as f64)
+                            .contains(&min)
+                            .then_some(min as i32)
+                    };
+                    let max = if max == f64::INFINITY {
+                        Some(i32::MAX)
+                    } else {
+                        let max = max.floor();
+                        (i32::MIN as f64..=i32::MAX as f64)
+                            .contains(&max)
+                            .then_some(max as i32)
+                    };
+
+                    match (min, max) {
+                        (Some(min), Some(max)) if min <= max => {
+                            problem.add_integer_var(coeff, (min, max))
+                        }
+                        (Some(_), Some(_)) => {
+                            construction_error.get_or_insert(ResolutionError::Infeasible);
+                            problem.add_integer_var(coeff, (0, 0))
+                        }
+                        _ => {
+                            construction_error.get_or_insert_with(|| {
+                                ResolutionError::Str(
+                                    "Microlp only supports integer bounds within the i32 range"
+                                        .to_string(),
+                                )
+                            });
+                            problem.add_integer_var(coeff, (0, 0))
+                        }
+                    }
                 } else {
                     problem.add_var(coeff, (min, max))
+                };
+                if let Some(value) = initial {
+                    initial_solution.push((microlp_var, value));
                 }
+                microlp_var
             },
         )
         .collect();
@@ -50,6 +92,10 @@ pub fn microlp(to_solve: UnsolvedProblem) -> MicroLpProblem {
         problem,
         variables,
         n_constraints: 0,
+        mip_gap: None,
+        time_limit: None,
+        initial_solution: (!initial_solution.is_empty()).then_some(initial_solution),
+        construction_error,
     }
 }
 
@@ -58,6 +104,10 @@ pub struct MicroLpProblem {
     problem: microlp::Problem,
     variables: Vec<microlp::Variable>,
     n_constraints: usize,
+    mip_gap: Option<f32>,
+    time_limit: Option<f64>,
+    initial_solution: Option<Vec<(microlp::Variable, f64)>>,
+    construction_error: Option<ResolutionError>,
 }
 
 impl MicroLpProblem {
@@ -69,8 +119,7 @@ impl MicroLpProblem {
 
 impl WithTimeLimit for MicroLpProblem {
     fn with_time_limit<T: Into<f64>>(mut self, seconds: T) -> Self {
-        self.problem
-            .set_time_limit(Duration::from_secs_f64(seconds.into()));
+        self.time_limit = Some(seconds.into());
         self
     }
 }
@@ -80,10 +129,19 @@ impl SolverModel for MicroLpProblem {
     type Error = ResolutionError;
 
     fn solve(self) -> Result<Self::Solution, Self::Error> {
-        let solution = self.problem.solve()?;
+        if let Some(error) = self.construction_error {
+            return Err(error);
+        }
+        let mut opts = SolveOptions::default();
+        opts.mip_gap = self.mip_gap.unwrap_or(0.0) as f64;
+        opts.time_limit = self.time_limit.map(Duration::from_secs_f64);
+        opts.warm_start = self.initial_solution;
+        let solution = self.problem.solve_with(opts)?;
+        let gap = solution.gap();
         Ok(MicroLpSolution {
             solution,
             variables: self.variables,
+            gap: gap.unwrap_or(0.0) as f32,
         })
     }
 
@@ -108,11 +166,28 @@ impl SolverModel for MicroLpProblem {
     }
 }
 
+impl WithInitialSolution for MicroLpProblem {
+    fn with_initial_solution(
+        mut self,
+        solution: impl IntoIterator<Item = (Variable, f64)>,
+    ) -> Self {
+        self.initial_solution = Some(
+            solution
+                .into_iter()
+                .map(|(variable, value)| (self.variables[variable.index()], value))
+                .collect(),
+        );
+        self
+    }
+}
+
 impl From<microlp::Error> for ResolutionError {
     fn from(microlp_error: Error) -> Self {
         match microlp_error {
             microlp::Error::Unbounded => Self::Unbounded,
             microlp::Error::Infeasible => Self::Infeasible,
+            microlp::Error::InvalidOperation(s) => Self::Str(s),
+            microlp::Error::InvalidOptions(s) => Self::Str(s),
             microlp::Error::InternalError(s) => Self::Str(s),
         }
     }
@@ -121,6 +196,7 @@ impl From<microlp::Error> for ResolutionError {
 /// The solution to a microlp problem
 pub struct MicroLpSolution {
     solution: microlp::Solution,
+    gap: f32,
     variables: Vec<microlp::Variable>,
 }
 
@@ -133,10 +209,19 @@ impl MicroLpSolution {
 
 impl Solution for MicroLpSolution {
     fn status(&self) -> SolutionStatus {
-        let solution_kind = self.solution.stop_reason();
+        let solution_kind = self.solution.status();
         match solution_kind {
-            StopReason::Finished => SolutionStatus::Optimal,
-            StopReason::Limit => SolutionStatus::TimeLimit,
+            Status::Optimal => {
+                if self.gap.is_finite() && self.gap > 0.0 {
+                    SolutionStatus::GapLimit
+                } else {
+                    SolutionStatus::Optimal
+                }
+            }
+            Status::Interrupted => SolutionStatus::TimeLimit,
+            //TODO should this be TimeLimit?
+            // this is reached when the solver timed out but found a feasible solution
+            Status::Feasible => SolutionStatus::TimeLimit,
         }
     }
     fn value(&self, variable: Variable) -> f64 {
@@ -144,9 +229,30 @@ impl Solution for MicroLpSolution {
     }
 }
 
+impl WithMipGap for MicroLpProblem {
+    fn mip_gap(&self) -> Option<f32> {
+        self.mip_gap
+    }
+
+    fn with_mip_gap(mut self, mip_gap: f32) -> Result<Self, MipGapError> {
+        if mip_gap.is_sign_negative() {
+            return Err(MipGapError::Negative);
+        } else if mip_gap.is_infinite() {
+            return Err(MipGapError::Infinite);
+        }
+
+        self.mip_gap = Option::Some(mip_gap);
+        Ok(self)
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use crate::{Solution, SolverModel, variable, variables};
+    use crate::{
+        Expression, ResolutionError, Solution, SolverModel,
+        solvers::{SolutionStatus, WithInitialSolution, WithMipGap, WithTimeLimit},
+        variable, variables,
+    };
 
     use super::microlp;
 
@@ -183,5 +289,137 @@ mod tests {
             (solution.value(x), solution.value(y), solution.value(z)),
             (2.0, 6.5, 1.0)
         )
+    }
+
+    #[test]
+    fn preserves_integer_points_inside_fractional_bounds() {
+        let mut vars = variables!();
+        let x = vars.add(variable().integer().clamp(0.9, 2.1));
+
+        let solution = vars.minimise(x).using(microlp).solve().unwrap();
+
+        assert_eq!(solution.value(x), 1.0);
+    }
+
+    #[test]
+    fn rejects_integer_bounds_without_an_integer_point() {
+        let mut vars = variables!();
+        let x = vars.add(variable().integer().clamp(0.1, 0.9));
+
+        assert!(matches!(
+            vars.minimise(x).using(microlp).solve(),
+            Err(ResolutionError::Infeasible)
+        ));
+    }
+
+    #[test]
+    fn rejects_integer_bounds_outside_microlps_domain() {
+        let mut vars = variables!();
+        let x = vars.add(
+            variable()
+                .integer()
+                .clamp(i32::MAX as f64 + 1.0, i32::MAX as f64 + 2.0),
+        );
+
+        assert!(matches!(
+            vars.minimise(x).using(microlp).solve(),
+            Err(ResolutionError::Str(message)) if message.contains("i32 range")
+        ));
+    }
+
+    #[test]
+    fn uses_an_initial_mip_solution() {
+        let mut vars = variables!();
+        let a = vars.add(variable().integer().clamp(0, 10));
+        let b = vars.add(variable().integer().clamp(0, 10));
+
+        let solution = vars
+            .minimise(3 * a + 4 * b)
+            .using(microlp)
+            .with((a + 2 * b) >> 5)
+            .with((3 * a + b) >> 4)
+            .with_initial_solution([(a, 3.0), (b, 1.0)])
+            .with_mip_gap(0.5)
+            .unwrap()
+            .solve()
+            .unwrap();
+
+        assert!(matches!(solution.status(), SolutionStatus::GapLimit));
+        assert_eq!((solution.value(a), solution.value(b)), (3.0, 1.0));
+    }
+
+    #[test]
+    fn can_solve_with_time_limit() {
+        let mut vars = variables!();
+        let x = vars.add(variable().clamp(0, 2));
+        let y = vars.add(variable().clamp(1, 3));
+        let solution = vars
+            .maximise(x + y)
+            .using(microlp)
+            .with((2 * x + y) << 4)
+            .with_time_limit(0)
+            .solve()
+            .unwrap();
+        assert!(matches!(solution.status(), SolutionStatus::TimeLimit));
+    }
+
+    #[test]
+    fn can_solve_with_gap_limit() {
+        let (status_optimal, value_optimal) = knapsack_value(None);
+        let (status_suboptimal, value_suboptimal) = knapsack_value(Some(0.5));
+
+        assert!(matches!(status_optimal, SolutionStatus::Optimal));
+        assert!(matches!(status_suboptimal, SolutionStatus::GapLimit));
+        assert!(value_suboptimal <= value_optimal);
+    }
+
+    fn knapsack_value(mipgap: Option<f32>) -> (SolutionStatus, f64) {
+        // (value, cost) of each object
+        let objects: Vec<(f64, f64)> = vec![
+            (1.87, 6.03),
+            (3.22, 8.03),
+            (9.91, 5.16),
+            (8.31, 1.72),
+            (7.00, 6.33),
+            (5.15, 8.20),
+            (8.01, 4.63),
+            (2.22, 1.50),
+            (7.04, 6.26),
+            (8.99, 9.62),
+            (2.13, 4.00),
+            (8.02, 8.02),
+            (3.07, 1.92),
+            (1.98, 9.03),
+            (7.23, 9.51),
+            (4.08, 3.24),
+            (9.65, 5.13),
+            (6.53, 3.07),
+            (6.76, 3.84),
+            (9.63, 8.33),
+        ];
+
+        let mut prob_vars = variables!();
+        let mut objective = Expression::with_capacity(objects.len());
+        let mut constraint = Expression::with_capacity(objects.len());
+
+        let budget: f64 = 25.0;
+        for (value, cost) in objects {
+            let var = prob_vars.add(variable().binary());
+            objective.add_mul(value, var);
+            constraint.add_mul(cost, var);
+        }
+
+        let mut model = prob_vars.maximise(objective.clone()).using(microlp);
+
+        if let Some(gap) = mipgap {
+            model = model.with_mip_gap(gap).unwrap();
+        }
+
+        model.add_constraint(constraint.leq(budget));
+
+        let solution = model.solve().unwrap();
+
+        // For this example we're interested only in the total value, not in the objects selected
+        (solution.status(), objective.eval_with(&solution))
     }
 }

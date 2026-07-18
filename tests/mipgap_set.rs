@@ -10,6 +10,9 @@ use good_lp::coin_cbc;
 #[cfg(feature = "highs")]
 use good_lp::highs;
 
+#[cfg(feature = "microlp")]
+use good_lp::microlp;
+
 #[cfg(feature = "lp-solvers")]
 use good_lp::{LpSolver, solvers::lp_solvers::GlpkSolver};
 
@@ -51,4 +54,10 @@ fn mipgap_set_highs() {
 #[test]
 fn mipgap_set_lp_solvers() {
     generic_mipgap_set(LpSolver(GlpkSolver::new()));
+}
+
+#[cfg(feature = "microlp")]
+#[test]
+fn mipgap_set_microlp() {
+    generic_mipgap_set(microlp);
 }
