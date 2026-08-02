@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use microlp::{Error, SolveOptions, Status};
+use microlp::{Error, SolveOptions, TerminationReason};
 
 use crate::solvers::MipGapError;
 use crate::variable::{UnsolvedProblem, VariableDefinition};
@@ -136,12 +136,18 @@ impl SolverModel for MicroLpProblem {
         opts.mip_gap = self.mip_gap.unwrap_or(0.0) as f64;
         opts.time_limit = self.time_limit.map(Duration::from_secs_f64);
         opts.warm_start = self.initial_solution;
-        let solution = self.problem.solve_with(opts)?;
-        let gap = solution.gap();
+        // An interrupted outcome carries no variable values, so the time limit
+        // expired before microlp found any feasible solution.
+        let solution = self
+            .problem
+            .solve_with(opts)?
+            .into_solution()
+            .map_err(|_| {
+                ResolutionError::Other("Time limit reached before finding a feasible solution")
+            })?;
         Ok(MicroLpSolution {
             solution,
             variables: self.variables,
-            gap: gap.unwrap_or(0.0) as f32,
         })
     }
 
@@ -196,7 +202,6 @@ impl From<microlp::Error> for ResolutionError {
 /// The solution to a microlp problem
 pub struct MicroLpSolution {
     solution: microlp::Solution,
-    gap: f32,
     variables: Vec<microlp::Variable>,
 }
 
@@ -209,19 +214,17 @@ impl MicroLpSolution {
 
 impl Solution for MicroLpSolution {
     fn status(&self) -> SolutionStatus {
-        let solution_kind = self.solution.status();
-        match solution_kind {
-            Status::Optimal => {
-                if self.gap.is_finite() && self.gap > 0.0 {
-                    SolutionStatus::GapLimit
-                } else {
-                    SolutionStatus::Optimal
-                }
-            }
-            Status::Interrupted => SolutionStatus::TimeLimit,
-            //TODO should this be TimeLimit?
-            // this is reached when the solver timed out but found a feasible solution
-            Status::Feasible => SolutionStatus::TimeLimit,
+        match self.solution.termination_reason() {
+            // The optimality proof completed.
+            TerminationReason::ProvenOptimal => SolutionStatus::Optimal,
+            // A feasible incumbent was within the requested relative gap.
+            TerminationReason::MipGap => SolutionStatus::GapLimit,
+            // The time budget ran out with a feasible incumbent.
+            TerminationReason::TimeLimit => SolutionStatus::TimeLimit,
+            // The branch & bound node budget ran out with a feasible
+            // incumbent, this is unused in good_lp
+            TerminationReason::NodeLimit => SolutionStatus::TimeLimit,
+            _ => SolutionStatus::TimeLimit,
         }
     }
     fn value(&self, variable: Variable) -> f64 {
@@ -349,18 +352,19 @@ mod tests {
     }
 
     #[test]
-    fn can_solve_with_time_limit() {
+    fn reports_a_time_limit_hit_before_any_solution() {
         let mut vars = variables!();
         let x = vars.add(variable().clamp(0, 2));
         let y = vars.add(variable().clamp(1, 3));
-        let solution = vars
+        // A zero time limit stops microlp before it can solve the relaxation,
+        // so there is no feasible solution to read values from.
+        let result = vars
             .maximise(x + y)
             .using(microlp)
             .with((2 * x + y) << 4)
             .with_time_limit(0)
-            .solve()
-            .unwrap();
-        assert!(matches!(solution.status(), SolutionStatus::TimeLimit));
+            .solve();
+        assert!(matches!(result, Err(ResolutionError::Other(_))));
     }
 
     #[test]
