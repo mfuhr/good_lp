@@ -73,6 +73,70 @@ where
     assert_float_eq!(5.0, dual.dual(c2), abs <= 1e-1);
 }
 
+#[allow(dead_code)]
+fn greater_than_shadow_price_for_solver<S: Solver>(solver: S)
+where
+    for<'a> <<S as Solver>::Model as SolverModel>::Solution: SolutionWithDual<'a>,
+{
+    let mut vars = variables!();
+    let x = vars.add_vector(variable().min(0), 4);
+    let objective = 4 * x[0] + 6 * x[1] + 7 * x[2] + 8 * x[3];
+    let mut problem = vars.maximise(objective).using(solver);
+
+    problem.add_constraint(constraint!(
+        2 * x[0] + 3 * x[1] + 4 * x[2] + 7 * x[3] <= 4600
+    ));
+    problem.add_constraint(constraint!(
+        3 * x[0] + 4 * x[1] + 5 * x[2] + 6 * x[3] <= 5000
+    ));
+    let lower_bound = problem.add_constraint(constraint!(x[3] >= 400));
+    problem.add_constraint(constraint!(x[0] + x[1] + x[2] + x[3] == 950));
+
+    let mut solution = problem.solve().expect("Library test");
+    let dual = solution.compute_dual();
+
+    // At the optimum x2 = x4 = 400. Increasing x4's lower bound by one
+    // exchanges one unit of x2 (coefficient 6) for x4 (coefficient 8), a
+    // change of 8 - 6 = 2; lower-bounded row duals use the opposite sign.
+    assert_float_eq!(-2.0, dual.dual(lower_bound), abs <= 1e-3);
+}
+
+#[allow(dead_code)]
+fn minimization_greater_than_shadow_price_for_solver<S: Solver>(solver: S)
+where
+    for<'a> <<S as Solver>::Model as SolverModel>::Solution: SolutionWithDual<'a>,
+{
+    let mut vars = variables!();
+    let x = vars.add(variable().min(0));
+    let mut problem = vars.minimise(x).using(solver);
+    let lower_bound = problem.add_constraint(constraint!(x >= 10));
+
+    let mut solution = problem.solve().expect("Library test");
+    assert_float_eq!(10.0, solution.value(x), abs <= 1e-3);
+
+    // Raising the lower bound by one raises the minimum of x by one.
+    let dual = solution.compute_dual();
+    assert_float_eq!(1.0, dual.dual(lower_bound), abs <= 1e-3);
+}
+
+#[allow(dead_code)]
+fn minimization_less_than_shadow_price_for_solver<S: Solver>(solver: S)
+where
+    for<'a> <<S as Solver>::Model as SolverModel>::Solution: SolutionWithDual<'a>,
+{
+    let mut vars = variables!();
+    let x = vars.add(variable());
+    let mut problem = vars.minimise(-x).using(solver);
+    let upper_bound = problem.add_constraint(constraint!(x <= 10));
+
+    let mut solution = problem.solve().expect("Library test");
+    assert_float_eq!(10.0, solution.value(x), abs <= 1e-3);
+
+    // Raising the upper bound by one lowers the minimum of -x by one.
+    let dual = solution.compute_dual();
+    assert_float_eq!(-1.0, dual.dual(upper_bound), abs <= 1e-3);
+}
+
 macro_rules! dual_test {
     ($([$solver_feature:literal, $solver:expr])*) => {
         #[test]
@@ -90,6 +154,33 @@ macro_rules! dual_test {
             $(
                 #[cfg(feature = $solver_feature)]
                 furniture_problem_for_solver($solver);
+            )*
+        }
+
+        #[test]
+        #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+        fn greater_than_shadow_price() {
+            $(
+                #[cfg(feature = $solver_feature)]
+                greater_than_shadow_price_for_solver($solver);
+            )*
+        }
+
+        #[test]
+        #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+        fn greater_than_shadow_price_for_minimization() {
+            $(
+                #[cfg(feature = $solver_feature)]
+                minimization_greater_than_shadow_price_for_solver($solver);
+            )*
+        }
+
+        #[test]
+        #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+        fn less_than_shadow_price_for_minimization() {
+            $(
+                #[cfg(feature = $solver_feature)]
+                minimization_less_than_shadow_price_for_solver($solver);
             )*
         }
     };

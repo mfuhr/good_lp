@@ -7,19 +7,27 @@ use std::ops::{Shl, Shr, Sub};
 /// A constraint represents a single (in)equality that must hold in the solution.
 #[derive(Clone)]
 pub struct Constraint {
-    /// The expression that is constrained to be null or negative
+    /// The expression, normalized to `sum(c_i * x_i) <= b_i`.
     pub(crate) expression: Expression,
-    /// if is_equality, represents expression == 0, otherwise, expression <= 0
-    pub(crate) is_equality: bool,
+    /// The kind originally written by the user; this is separate because the
+    /// expression above remains normalized even for an original `>=` constraint.
+    pub(crate) kind: ConstraintKind,
     /// Optional constraint name
     pub(crate) name: Option<String>,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum ConstraintKind {
+    LessOrEqual,
+    GreaterOrEqual,
+    Equal,
+}
+
 impl Constraint {
-    fn new(expression: Expression, is_equality: bool) -> Constraint {
+    fn new(expression: Expression, kind: ConstraintKind) -> Constraint {
         Constraint {
             expression,
-            is_equality,
+            kind,
             name: None,
         }
     }
@@ -37,7 +45,13 @@ impl Constraint {
 
     /// if is_equality, represents expression == 0, otherwise, expression <= 0
     pub fn is_equality(&self) -> bool {
-        self.is_equality
+        matches!(self.kind, ConstraintKind::Equal)
+    }
+
+    pub(crate) fn is_greater_than_or_equal(&self) -> bool {
+        // The coefficients remain in the normalized `sum(c_i * x_i) <= b_i`
+        // form; this records only the user's original inequality direction.
+        matches!(self.kind, ConstraintKind::GreaterOrEqual)
     }
 
     /// get the constraint name, if it exists.
@@ -52,7 +66,7 @@ impl FormatWithVars for Constraint {
         FUN: FnMut(&mut Formatter<'_>, Variable) -> std::fmt::Result,
     {
         self.expression.linear.format_with(f, variable_format)?;
-        write!(f, " {} ", if self.is_equality { "=" } else { "<=" })?;
+        write!(f, " {} ", if self.is_equality() { "=" } else { "<=" })?;
         write!(f, "{}", -self.expression.constant)
     }
 }
@@ -65,17 +79,21 @@ impl Debug for Constraint {
 
 /// equals
 pub fn eq<B, A: Sub<B, Output = Expression>>(a: A, b: B) -> Constraint {
-    Constraint::new(a - b, true)
+    Constraint::new(a - b, ConstraintKind::Equal)
 }
 
 /// less than or equal
 pub fn leq<B, A: Sub<B, Output = Expression>>(a: A, b: B) -> Constraint {
-    Constraint::new(a - b, false)
+    Constraint::new(a - b, ConstraintKind::LessOrEqual)
 }
 
 /// greater than or equal
 pub fn geq<A, B: Sub<A, Output = Expression>>(a: A, b: B) -> Constraint {
-    leq(b, a)
+    let mut constraint = leq(b, a);
+    // Keep the canonical `b - a <= 0` expression, but remember that the user
+    // wrote `a >= b` so dual-capable solvers can restore the row orientation.
+    constraint.kind = ConstraintKind::GreaterOrEqual;
+    constraint
 }
 
 macro_rules! impl_shifts {

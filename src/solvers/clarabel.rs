@@ -24,14 +24,14 @@ pub fn clarabel(to_solve: UnsolvedProblem) -> ClarabelProblem {
         direction,
         variables,
     } = to_solve;
-    let coef = if direction == ObjectiveDirection::Maximisation {
+    let objective_factor = if direction == ObjectiveDirection::Maximisation {
         -1.
     } else {
         1.
     };
     let mut objective_vector = vec![0.; variables.len()];
     for (var, obj) in objective.linear_coefficients() {
-        objective_vector[var.index()] = obj * coef;
+        objective_vector[var.index()] = obj * objective_factor;
     }
     let constraints_matrix_builder = CscMatrixBuilder::new(variables.len());
     let mut settings = DefaultSettingsBuilder::default();
@@ -40,6 +40,21 @@ pub fn clarabel(to_solve: UnsolvedProblem) -> ClarabelProblem {
         objective: objective_vector,
         constraints_matrix_builder,
         constraint_values: Vec::new(),
+        shadow_price_scales: Vec::new(),
+        // Clarabel's standard form is
+        //
+        //     minimize g(x), subject to A*x + s = b
+        //
+        // (https://clarabel.org/stable/rust/getting_started_rs/#problem-format),
+        // and `DefaultSolution::z` is the dual solution
+        // (https://docs.rs/clarabel/0.11.0/clarabel/solver/implementations/default/struct.DefaultSolution.html#structfield.z).
+        // Thus the Lagrangian contains `z' * (A*x + s - b)`, so the
+        // sensitivity of Clarabel's objective to `b` is `d g*/d b = -z`.
+        // Since `g = objective_factor * f`, the objective part of the
+        // conversion from `z` to good_lp's shadow price is
+        // `-objective_factor`. The row's RHS transformation is composed with
+        // this factor in `add_constraint` below.
+        objective_shadow_price_scale: -objective_factor,
         variables: variables.len(),
         settings,
         cones: Vec::new(),
@@ -63,6 +78,11 @@ pub fn clarabel(to_solve: UnsolvedProblem) -> ClarabelProblem {
 pub struct ClarabelProblem {
     constraints_matrix_builder: CscMatrixBuilder,
     constraint_values: Vec<f64>,
+    /// Final multiplier from each Clarabel dual `z_i` to good_lp's shadow price.
+    shadow_price_scales: Vec<f64>,
+    /// Objective-only part of that multiplier; the row part is applied when
+    /// the constraint is added.
+    objective_shadow_price_scale: f64,
     objective: Vec<f64>,
     variables: usize,
     settings: DefaultSettingsBuilder<f64>,
@@ -112,7 +132,9 @@ impl SolverModel for ClarabelProblem {
     type Error = ResolutionError;
 
     fn solve(self) -> Result<Self::Solution, Self::Error> {
-        let mut solver = self.try_into_solver()?;
+        let mut problem = self;
+        let shadow_price_scales = std::mem::take(&mut problem.shadow_price_scales);
+        let mut solver = problem.try_into_solver()?;
         solver.solve();
         match solver.solution.status {
             SolverStatus::PrimalInfeasible | SolverStatus::AlmostPrimalInfeasible => {
@@ -123,6 +145,7 @@ impl SolverModel for ClarabelProblem {
             | SolverStatus::AlmostDualInfeasible
             | SolverStatus::DualInfeasible => Ok(ClarabelSolution {
                 solution: solver.solution,
+                shadow_price_scales,
             }),
             SolverStatus::Unsolved => Err(ResolutionError::Other("Unsolved")),
             SolverStatus::MaxIterations => Err(ResolutionError::Other("Max iterations reached")),
@@ -134,13 +157,23 @@ impl SolverModel for ClarabelProblem {
     }
 
     fn add_constraint(&mut self, constraint: Constraint) -> ConstraintReference {
+        let is_equality = constraint.is_equality();
+        let is_greater_than_or_equal = constraint.is_greater_than_or_equal();
         self.constraints_matrix_builder
             .add_row(constraint.expression.linear);
         let index = self.constraint_values.len();
         self.constraint_values.push(-constraint.expression.constant);
+        // good_lp stores `lhs >= rhs` as `rhs - lhs <= 0`. Consequently the
+        // corresponding Clarabel bound `b` changes by -1 when the user-written
+        // `rhs` changes by +1. For `<=` and `==` rows it changes by +1. Compose
+        // that `d b/d rhs` with the objective scale derived in `clarabel` so
+        // dual retrieval only has to multiply by the completed conversion.
+        let rhs_scale = if is_greater_than_or_equal { -1. } else { 1. };
+        self.shadow_price_scales
+            .push(self.objective_shadow_price_scale * rhs_scale);
         // Cones indicate the type of constraint. We only support nonnegative and equality constraints.
         // To avoid creating a new cone for each constraint, we merge them.
-        let next_cone = if constraint.is_equality {
+        let next_cone = if is_equality {
             ZeroConeT(1)
         } else {
             NonnegativeConeT(1)
@@ -162,6 +195,7 @@ impl SolverModel for ClarabelProblem {
 /// The solution to a clarabel problem
 pub struct ClarabelSolution {
     solution: DefaultSolution<f64>,
+    shadow_price_scales: Vec<f64>,
 }
 
 impl ClarabelSolution {
@@ -195,7 +229,7 @@ impl<'a> SolutionWithDual<'a> for ClarabelSolution {
 
 impl DualValues for &ClarabelSolution {
     fn dual(&self, constraint: ConstraintReference) -> f64 {
-        self.solution.z[constraint.index]
+        self.solution.z[constraint.index] * self.shadow_price_scales[constraint.index]
     }
 }
 
