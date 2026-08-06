@@ -48,6 +48,14 @@ impl Constraint {
         matches!(self.kind, ConstraintKind::Equal)
     }
 
+    /// Returns whether the user wrote this constraint with `>=`.
+    ///
+    /// The stored expression is normalized to `<=`, so this reports the
+    /// original inequality direction rather than inferring it from the
+    /// expression.
+    // Solver backends may need the original inequality direction when exposing
+    // dual values, including backends that are not enabled in this build.
+    #[allow(dead_code)]
     pub(crate) fn is_greater_than_or_equal(&self) -> bool {
         // The coefficients remain in the normalized `sum(c_i * x_i) <= b_i`
         // form; this records only the user's original inequality direction.
